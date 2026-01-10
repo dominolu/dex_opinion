@@ -254,7 +254,6 @@
                 },
                 timeout: CONSTANTS.API_TIMEOUT
             });
-            });
         });
     }
 
@@ -1325,26 +1324,6 @@
                             gap: 8px;
                             cursor: pointer;
                         ">
-                            <input type="checkbox" id="cfg-autoStart" ${config.autoStart ? 'checked' : ''}
-                                style="
-                                    width: 18px;
-                                    height: 18px;
-                                    cursor: pointer;
-                                    accent-color: #3b82f6;
-                                "
-                            >
-                            自动开始交易
-                        </label>
-
-                        <label style="
-                            color: #374151;
-                            font-weight: 500;
-                            font-size: 14px;
-                            display: flex;
-                            align-items: center;
-                            gap: 8px;
-                            cursor: pointer;
-                        ">
                             <input type="checkbox" id="cfg-enableLog" ${config.enableLog ? 'checked' : ''}
                                 style="
                                     width: 18px;
@@ -1399,7 +1378,6 @@
                 waitBeforeTrade: parseInt(document.getElementById('cfg-waitBeforeTrade').value),
                 sellWaitTime: parseInt(document.getElementById('cfg-sellWaitTime').value),
                 useApiFirst: document.getElementById('cfg-useApiFirst').checked,
-                autoStart: document.getElementById('cfg-autoStart').checked,
                 enableLog: document.getElementById('cfg-enableLog').checked
             };
 
@@ -1568,11 +1546,10 @@
             createControlPanel();
         }
 
-        if (Config.get('autoStart')) {
-            log('自动开始已启用,准备执行交易...', 'info');
-            const trader = new OpinionTrader();
-            setTimeout(() => trader.start(), 2000);
-        }
+        // 无论配置如何,都等待手动启动
+        log('✅ 脚本已加载完成', 'success');
+        log('💡 点击页面右上角的"开始交易"按钮启动自动交易', 'info');
+        log('💡 或使用油猴菜单: ▶️ 开始交易', 'info');
     }
 
     init();
