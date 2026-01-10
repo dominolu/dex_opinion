@@ -541,6 +541,125 @@
         });
     }
 
+    /**
+     * 查询当前订单
+     * @param {string} walletAddress - 钱包地址
+     * @param {string} parentTopicId - 父主题ID
+     * @returns {Promise<Object|null>} 订单列表
+     */
+    async function fetchCurrentOrders(walletAddress, parentTopicId) {
+        return new Promise((resolve) => {
+            const apiUrl = `https://proxy.opinion.trade:8443/api/bsc/api/v2/order?page=1&limit=10&walletAddress=${walletAddress}&parentTopicId=${parentTopicId}&queryType=1`;
+
+            log(`正在查询当前订单...`, 'info');
+
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: apiUrl,
+                headers: {
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json'
+                },
+                onload: function(response) {
+                    try {
+                        if (response.status === 200) {
+                            const data = JSON.parse(response.responseText);
+
+                            if (data.errno === 0 && data.result && data.result.list) {
+                                const orders = data.result.list;
+                                log(`✅ 查询到 ${orders.length} 个订单`, 'success');
+
+                                orders.forEach(order => {
+                                    log(`  订单ID: ${order.orderId}, transNo: ${order.transNo}`, 'info');
+                                    log(`    主题: ${order.topicTitle}, 方向: ${order.side === 1 ? '买入' : '卖出'}`, 'info');
+                                    log(`    价格: ${order.price}, 数量: ${order.amount}`, 'info');
+                                    log(`    成交: ${order.filled}, 状态: ${order.status}`, 'info');
+                                });
+
+                                resolve(orders);
+                            } else {
+                                log(`API返回错误: ${data.errmsg || '未知错误'}`, 'warn');
+                                resolve(null);
+                            }
+                        } else {
+                            log(`API请求失败,状态码: ${response.status}`, 'warn');
+                            resolve(null);
+                        }
+                    } catch (error) {
+                        log(`解析订单数据失败: ${error.message}`, 'error');
+                        resolve(null);
+                    }
+                },
+                onerror: function(error) {
+                    log(`查询订单网络请求失败`, 'error');
+                    resolve(null);
+                },
+                ontimeout: function() {
+                    log('查询订单请求超时', 'warn');
+                    resolve(null);
+                },
+                timeout: CONSTANTS.API_TIMEOUT
+            });
+        });
+    }
+
+    /**
+     * 撤销订单
+     * @param {string} transNo - 订单交易号
+     * @param {number} chainId - 链ID (默认56为BSC)
+     * @returns {Promise<boolean>} 是否成功
+     */
+    async function cancelOrder(transNo, chainId = 56) {
+        return new Promise((resolve) => {
+            const apiUrl = 'https://proxy.opinion.trade:8443/api/bsc/api/v1/order/cancel/order';
+
+            log(`正在撤销订单: ${transNo}`, 'info');
+
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: apiUrl,
+                headers: {
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json'
+                },
+                data: JSON.stringify({
+                    trans_no: transNo,
+                    chainId: chainId
+                }),
+                onload: function(response) {
+                    try {
+                        if (response.status === 200) {
+                            const data = JSON.parse(response.responseText);
+
+                            if (data.errno === 0) {
+                                log(`✅ 订单撤销成功: ${transNo}`, 'success');
+                                resolve(true);
+                            } else {
+                                log(`订单撤销失败: ${data.errmsg || '未知错误'}`, 'warn');
+                                resolve(false);
+                            }
+                        } else {
+                            log(`订单撤销请求失败,状态码: ${response.status}`, 'warn');
+                            resolve(false);
+                        }
+                    } catch (error) {
+                        log(`解析撤单响应失败: ${error.message}`, 'error');
+                        resolve(false);
+                    }
+                },
+                onerror: function(error) {
+                    log(`撤销订单网络请求失败`, 'error');
+                    resolve(false);
+                },
+                ontimeout: function() {
+                    log('撤销订单请求超时', 'warn');
+                    resolve(false);
+                },
+                timeout: CONSTANTS.API_TIMEOUT
+            });
+        });
+    }
+
     // ==================== 核心交易逻辑 ====================
     let currentTrader = null;
 
@@ -871,22 +990,50 @@
         }
 
         /**
-         * 监控订单成交情况 (市价单模式下,买入后直接返回true)
+         * 监控订单成交情况
+         * 检测订单是否成交,或者是否出现持仓
          */
         async monitorOrders() {
-            log('👀 检查成交状态...', 'info');
+            log('👀 开始监控订单成交...', 'info');
 
-            // 由于我们使用市价单直接买入,placeBothOrders() 中已经等待了持仓确认
-            // 这里只需要验证一下是否有持仓
-            const hasPositions = await this.checkPositions();
+            const maxWait = CONSTANTS.MAKER_MAX_WAIT_TIME;
+            const checkInterval = CONSTANTS.MAKER_ORDER_CHECK_INTERVAL;
+            let elapsedTime = 0;
 
-            if (hasPositions) {
-                log('✅ 检测到持仓存在 (市价单已成交)', 'success');
-                return true;
-            } else {
-                log('⚠️ 未检测到持仓,可能交易未成功', 'warn');
-                return false;
+            while (elapsedTime < maxWait && !this.shouldStop) {
+                await sleep(checkInterval);
+                elapsedTime += checkInterval;
+
+                // 方法1: 检查持仓变化 (如果订单成交,会有持仓)
+                const hasPositions = await this.checkPositions();
+                if (hasPositions) {
+                    log('✅ 检测到持仓出现 (订单可能已成交)', 'success');
+                    return true;
+                }
+
+                // 方法2: 查询订单状态 (可选)
+                if (elapsedTime % 5000 === 0) { // 每5秒查询一次订单状态
+                    const walletAddress = await getWalletAddress();
+                    if (walletAddress) {
+                        const orders = await fetchCurrentOrders(walletAddress, this.marketInfo.topicId);
+                        if (orders && orders.length > 0) {
+                            // 检查是否有订单已完成
+                            const completedOrders = orders.filter(o => o.status === 2);
+                            if (completedOrders.length > 0) {
+                                log(`✅ 检测到 ${completedOrders.length} 个订单已完成`, 'success');
+                                return true;
+                            }
+                        }
+                    }
+                }
+
+                if (elapsedTime % 10000 === 0) {
+                    log(`⏳ 等待成交中... (${(elapsedTime/1000).toFixed(0)}秒)`, 'info');
+                }
             }
+
+            log('⏰ 等待超时,未检测到成交', 'warn');
+            return false;
         }
 
         /**
@@ -914,12 +1061,46 @@
         }
 
         /**
-         * 取消未成交的订单 (市价单模式下无需撤单)
+         * 取消未成交的订单 (使用撤单 API)
          */
         async cancelPendingOrders() {
-            log('🚫 跳过撤单步骤 (市价单模式下无需撤单)', 'info');
-            // 由于我们使用市价单直接买入,没有挂单等待,所以不需要撤单
-            return true;
+            log('🚫 正在取消未成交订单...', 'info');
+
+            // 获取钱包地址
+            const walletAddress = await getWalletAddress();
+            if (!walletAddress) {
+                log('⚠️ 无法获取钱包地址,跳过撤单', 'warn');
+                return false;
+            }
+
+            // 查询当前订单
+            const orders = await fetchCurrentOrders(walletAddress, this.marketInfo.topicId);
+            if (!orders || orders.length === 0) {
+                log('✅ 没有待撤销的订单', 'success');
+                return true;
+            }
+
+            // 撤销所有未完成的订单
+            let cancelCount = 0;
+            for (const order of orders) {
+                // status: 1 = 进行中, 2 = 已完成, 3 = 已取消
+                if (order.status === 1 && order.transNo) {
+                    log(`准备撤销订单: ${order.transNo}`, 'info');
+                    const success = await cancelOrder(order.transNo, order.chainId);
+                    if (success) {
+                        cancelCount++;
+                    }
+                    await sleep(500); // 避免请求过快
+                }
+            }
+
+            if (cancelCount > 0) {
+                log(`✅ 成功撤销 ${cancelCount} 个订单`, 'success');
+                return true;
+            } else {
+                log('⚠️ 没有可撤销的订单', 'warn');
+                return false;
+            }
         }
 
         /**
