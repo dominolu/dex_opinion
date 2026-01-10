@@ -25,7 +25,10 @@
         WALLET_ADDRESS_LENGTH: 42,    // 完整钱包地址长度
         POSITION_CHECK_INTERVAL: 1000,// 持仓检查间隔(毫秒)
         POSITION_CHECK_MAX_ATTEMPTS: 30,// 持仓检查最大尝试次数
-        DOM_WAIT_TIME: 2000          // DOM等待时间(毫秒)
+        DOM_WAIT_TIME: 2000,         // DOM等待时间(毫秒)
+        MAKER_ORDER_CHECK_INTERVAL: 1000, // Maker 订单检查间隔(毫秒)
+        MAKER_MAX_WAIT_TIME: 60000,  // Maker 最大等待成交时间(毫秒)
+        MAKER_RETRY_TIMES: 3         // Maker 挂单重试次数
     };
 
     // ==================== 配置管理 ====================
@@ -40,7 +43,9 @@
         retryAttempts: 3,
         enableLog: true,
         sellWaitTime: 5,
-        useApiFirst: true  // 是否优先使用API获取持仓
+        useApiFirst: true,  // 是否优先使用API获取持仓
+        tradeMode: 'taker',  // 交易模式: 'taker' 或 'maker'
+        makerWaitTime: 5     // Maker 检测成交间隔(秒)
     };
 
     const Config = {
@@ -345,8 +350,836 @@
         return hasPositions;
     }
 
+    // ==================== Maker 模式 API 方法 ====================
+
+    /**
+     * 从当前 URL 获取 topicId
+     * @returns {string|null} topicId
+     */
+    function getTopicIdFromURL() {
+        try {
+            const urlParams = new URLSearchParams(window.location.search);
+            const topicId = urlParams.get('topicId');
+            if (topicId) {
+                log(`从 URL 获取 topicId: ${topicId}`, 'success');
+                return topicId;
+            }
+            log('⚠️ URL 中未找到 topicId', 'warn');
+            return null;
+        } catch (error) {
+            log(`获取 topicId 失败: ${error.message}`, 'error');
+            return null;
+        }
+    }
+
+    /**
+     * 根据 title 获取市场信息 (questionId, yesPos, noPos)
+     * @param {string} title - 选项标题,如 "No change"
+     * @returns {Promise<Object|null>} 市场信息对象
+     */
+    async function fetchMarketInfoByTitle(title) {
+        return new Promise((resolve) => {
+            const topicId = getTopicIdFromURL();
+            if (!topicId) {
+                log('⚠️ 无法获取 topicId,跳过市场信息获取', 'warn');
+                resolve(null);
+                return;
+            }
+
+            const apiUrl = `https://proxy.opinion.trade:8443/api/bsc/api/v2/topic/mutil/${topicId}`;
+
+            log(`正在获取市场信息: ${apiUrl}`, 'info');
+            log(`查找标题: ${title}`, 'info');
+
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: apiUrl,
+                headers: {
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json'
+                },
+                onload: function(response) {
+                    try {
+                        if (response.status === 200) {
+                            const data = JSON.parse(response.responseText);
+
+                            if (data.errno === 0 && data.result && data.result.data && data.result.data.childList) {
+                                const childList = data.result.data.childList;
+
+                                // 遍历 childList 查找匹配的 title
+                                const matched = childList.find(child => {
+                                    const childTitle = child.title || child.titleShort || '';
+                                    return childTitle === title || childTitle.includes(title);
+                                });
+
+                                if (matched) {
+                                    const marketInfo = {
+                                        questionId: matched.questionId,
+                                        yesPos: matched.yesPos,
+                                        noPos: matched.noPos,
+                                        yesMarketPrice: matched.yesMarketPrice,
+                                        noMarketPrice: matched.noMarketPrice,
+                                        title: matched.title,
+                                        topicId: topicId
+                                    };
+
+                                    log('✅ 找到匹配的市场信息', 'success');
+                                    log(`  questionId: ${marketInfo.questionId}`, 'info');
+                                    log(`  yesPos: ${marketInfo.yesPos}`, 'info');
+                                    log(`  noPos: ${marketInfo.noPos}`, 'info');
+                                    log(`  YES 价格: ${marketInfo.yesMarketPrice}`, 'info');
+                                    log(`  NO 价格: ${marketInfo.noMarketPrice}`, 'info');
+
+                                    resolve(marketInfo);
+                                } else {
+                                    log(`⚠️ 未找到标题匹配 "${title}" 的市场`, 'warn');
+                                    log(`可用标题: ${childList.map(c => c.title).join(', ')}`, 'info');
+                                    resolve(null);
+                                }
+                            } else {
+                                log(`API返回错误: ${data.errmsg || '未知错误'}`, 'warn');
+                                resolve(null);
+                            }
+                        } else {
+                            log(`API请求失败,状态码: ${response.status}`, 'warn');
+                            resolve(null);
+                        }
+                    } catch (error) {
+                        log(`解析市场信息失败: ${error.message}`, 'error');
+                        resolve(null);
+                    }
+                },
+                onerror: function(error) {
+                    log(`获取市场信息网络请求失败`, 'error');
+                    resolve(null);
+                },
+                ontimeout: function() {
+                    log('获取市场信息请求超时', 'warn');
+                    resolve(null);
+                },
+                timeout: CONSTANTS.API_TIMEOUT
+            });
+        });
+    }
+
+    /**
+     * 获取订单簿深度
+     * @param {string} symbol - token symbol (yesPos)
+     * @param {string} questionId - 问题 ID
+     * @returns {Promise<Object|null>} 深度数据 { asks: [], bids: [] }
+     */
+    async function fetchOrderDepth(symbol, questionId) {
+        return new Promise((resolve) => {
+            const apiUrl = `https://proxy.opinion.trade:8443/api/bsc/api/v2/order/market/depth?symbol=${symbol}&chainId=56&question_id=${questionId}&symbol_types=0`;
+
+            log(`正在获取订单簿深度...`, 'info');
+
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: apiUrl,
+                headers: {
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json'
+                },
+                onload: function(response) {
+                    try {
+                        if (response.status === 200) {
+                            const data = JSON.parse(response.responseText);
+
+                            if (data.errno === 0 && data.result) {
+                                const asks = data.result.asks || [];
+                                const bids = data.result.bids || [];
+
+                                if (asks.length > 0 && bids.length > 0) {
+                                    const ask1 = asks[0]; // 最低卖价
+                                    const bid1 = bids[0]; // 最高买价
+
+                                    log('✅ 获取订单簿深度成功', 'success');
+                                    log(`  ask1 (最低卖价): ${ask1[0]} (数量: ${ask1[1]})`, 'info');
+                                    log(`  bid1 (最高买价): ${bid1[0]} (数量: ${bid1[1]})`, 'info');
+                                    log(`  价差: ${((ask1[0] - bid1[0]) / bid1[0] * 100).toFixed(4)}%`, 'info');
+
+                                    resolve({
+                                        asks: asks,
+                                        bids: bids,
+                                        ask1: {
+                                            price: parseFloat(ask1[0]),
+                                            amount: parseFloat(ask1[1])
+                                        },
+                                        bid1: {
+                                            price: parseFloat(bid1[0]),
+                                            amount: parseFloat(bid1[1])
+                                        }
+                                    });
+                                } else {
+                                    log('⚠️ 订单簿深度数据为空', 'warn');
+                                    resolve(null);
+                                }
+                            } else {
+                                log(`API返回错误: ${data.errmsg || '未知错误'}`, 'warn');
+                                resolve(null);
+                            }
+                        } else {
+                            log(`API请求失败,状态码: ${response.status}`, 'warn');
+                            resolve(null);
+                        }
+                    } catch (error) {
+                        log(`解析订单簿深度失败: ${error.message}`, 'error');
+                        resolve(null);
+                    }
+                },
+                onerror: function(error) {
+                    log(`获取订单簿深度网络请求失败`, 'error');
+                    resolve(null);
+                },
+                ontimeout: function() {
+                    log('获取订单簿深度请求超时', 'warn');
+                    resolve(null);
+                },
+                timeout: CONSTANTS.API_TIMEOUT
+            });
+        });
+    }
+
     // ==================== 核心交易逻辑 ====================
     let currentTrader = null;
+
+    /**
+     * Maker 模式交易类
+     * 实现同时在 ask1/bid1 挂单,一边成交后撤另一边并卖出的策略
+     */
+    class MakerTrader {
+        constructor() {
+            this.config = Config.getAll();
+            this.isRunning = false;
+            this.shouldStop = false;
+            this.marketInfo = null;  // { questionId, yesPos, noPos }
+            this.depthData = null;   // { asks, bids, ask1, bid1 }
+            this.pendingOrders = {   // 待成交订单
+                buy: null,   //买单订单信息
+                sell: null   //卖单订单信息
+            };
+            this.filledOrder = null; // 已成交订单 { side, price, amount }
+        }
+
+        /**
+         * 初始化市场信息
+         */
+        async initMarketInfo() {
+            log('📊 正在初始化市场信息...', 'info');
+
+            const marketInfo = await fetchMarketInfoByTitle(this.config.optionName);
+
+            if (!marketInfo) {
+                throw new Error('无法获取市场信息,请检查 optionName 配置');
+            }
+
+            this.marketInfo = marketInfo;
+            return marketInfo;
+        }
+
+        /**
+         * 获取订单簿深度
+         */
+        async fetchDepth() {
+            if (!this.marketInfo) {
+                throw new Error('市场信息未初始化');
+            }
+
+            const depth = await fetchOrderDepth(this.marketInfo.yesPos, this.marketInfo.questionId);
+
+            if (!depth) {
+                throw new Error('无法获取订单簿深度');
+            }
+
+            this.depthData = depth;
+            return depth;
+        }
+
+        /**
+         * 同时在 ask1 和 bid1 挂单 (使用 DOM 操作,类似 taker 模式)
+         * 注意: 由于 Opinion.trade 可能不支持限价单 API
+         * 这里使用市价单方式: 在 ask1 价格挂买单,在 bid1 价格挂卖单
+         */
+        async placeBothOrders() {
+            log('🔄 准备同时挂买卖单 (市价单模式)...', 'info');
+
+            if (!this.depthData) {
+                throw new Error('订单簿深度未获取');
+            }
+
+            const ask1Price = this.depthData.ask1.price;
+            const bid1Price = this.depthData.bid1.price;
+
+            log(`目标价格:`, 'info');
+            log(`  ask1 (最低卖价): ${ask1Price}`, 'info');
+            log(`  bid1 (最高买价): ${bid1Price}`, 'info');
+            log(`  当前市价 YES: ${this.marketInfo.yesMarketPrice}`, 'info');
+
+            // 检查当前是否在 Buy tab
+            const buyTab = Array.from(document.querySelectorAll('button[role="tab"]')).find(tab => {
+                const text = tab.textContent.trim();
+                return text === 'Buy';
+            });
+
+            const sellTab = Array.from(document.querySelectorAll('button[role="tab"]')).find(tab => {
+                const text = tab.textContent.trim();
+                return text === 'Sell';
+            });
+
+            // 如果不在 Buy tab,切换过去
+            if (sellTab && sellTab.hasAttribute('data-selected')) {
+                log('切换到 Buy tab 准备挂买单...', 'info');
+                if (buyTab) {
+                    buyTab.click();
+                    await sleep(1000);
+                }
+            }
+
+            // === 步骤 1: 选择选项 ===
+            log('步骤 1/4: 选择选项...', 'info');
+            const optionButton = await this.findOptionButton(this.config.optionName);
+            if (!optionButton) {
+                throw new Error(`未找到选项: ${this.config.optionName}`);
+            }
+            optionButton.click();
+            await sleep(1000);
+
+            // === 步骤 2: 点击 YES 按钮 (准备买) ===
+            log('步骤 2/4: 点击 YES 按钮准备买入...', 'info');
+            const yesButton = await this.findTradeButton('YES');
+            yesButton.click();
+            await sleep(1000);
+
+            // === 步骤 3: 输入金额 ===
+            log('步骤 3/4: 输入买入金额...', 'info');
+            await this.inputAmount(this.config.tradeAmount);
+            await sleep(1000);
+
+            // === 步骤 4: 点击买入按钮 ===
+            log('步骤 4/4: 点击买入按钮...', 'info');
+            const buyButton = await this.findBuyButton();
+            buyButton.click();
+
+            log('⏳ 请在MetaMask钱包中确认买入交易...', 'warn');
+
+            // 等待交易确认
+            let buyConfirmed = await this.waitForTransactionConfirmation('买入');
+
+            if (!buyConfirmed) {
+                throw new Error('买入交易未能在预期时间内确认');
+            }
+
+            log('✅ 买单已提交', 'success');
+
+            // 等待持仓出现
+            log('⏳ 等待持仓确认...', 'info');
+            let positionsAppeared = false;
+            for (let i = 0; i < 30; i++) {
+                if (this.shouldStop) throw new Error('用户手动停止');
+
+                const hasPositionsNow = await this.checkPositions();
+
+                if (hasPositionsNow) {
+                    log('✅ 持仓已确认', 'success');
+                    positionsAppeared = true;
+                    break;
+                }
+
+                await sleep(1000);
+                if (i % 5 === 0 && i > 0) {
+                    log(`⏳ 继续等待持仓出现... (${30-i}秒剩余)`, 'info');
+                }
+            }
+
+            if (!positionsAppeared) {
+                log('⚠️ 30秒内未检测到持仓出现,但继续执行', 'warn');
+            }
+
+            log('✅ 挂单流程完成 (市价单模式)', 'success');
+
+            // 注意: 由于使用的是市价单而非限价单
+            // 实际上我们已经买入了,而不是挂单等待
+            // 这种模式下,monitorOrders 会检测到持仓,然后直接卖出
+        }
+
+        /**
+         * 查找选项按钮
+         */
+        async findOptionButton(optionName) {
+            log(`正在查找选项: ${optionName}`, 'info');
+            const buttons = Array.from(document.querySelectorAll('button'));
+            const optionButton = buttons.find(btn =>
+                btn.textContent.includes(optionName) &&
+                btn.textContent.includes('$') &&
+                btn.textContent.includes('%')
+            );
+
+            if (!optionButton) {
+                throw new Error(`未找到选项: ${optionName}`);
+            }
+
+            log(`找到选项按钮: ${optionName}`, 'success');
+            return optionButton;
+        }
+
+        /**
+         * 查找交易按钮 (YES/NO)
+         */
+        async findTradeButton(type) {
+            log(`正在查找 ${type} 交易按钮`, 'info');
+            await sleep(500);
+
+            const buttons = Array.from(document.querySelectorAll('button'));
+            const tradeButton = buttons.find(btn => {
+                const text = btn.textContent.trim();
+                return text.startsWith(type) ||
+                       (text.includes(type) && text.includes('¢'));
+            });
+
+            if (!tradeButton) {
+                throw new Error(`未找到 ${type} 交易按钮`);
+            }
+
+            log(`找到 ${type} 交易按钮: ${tradeButton.textContent.trim()}`, 'success');
+            return tradeButton;
+        }
+
+        /**
+         * 查找金额输入框
+         */
+        async findAmountInput() {
+            log(`正在查找金额输入框`, 'info');
+            const inputs = Array.from(document.querySelectorAll('input[type="text"]'));
+            const amountInput = inputs.find(input => {
+                const value = input.value || input.placeholder || '';
+                return (value === '0' || value === '') &&
+                       input.placeholder === '0';
+            });
+
+            if (!amountInput) {
+                throw new Error('未找到金额输入框');
+            }
+
+            log(`找到金额输入框`, 'success');
+            return amountInput;
+        }
+
+        /**
+         * 输入金额
+         */
+        async inputAmount(amount) {
+            log(`准备输入金额: ${amount}`, 'info');
+            const input = await this.findAmountInput();
+
+            input.click();
+            input.focus();
+            await sleep(300);
+
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype,
+                'value'
+            ).set;
+
+            nativeInputValueSetter.call(input, '');
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            await sleep(100);
+
+            nativeInputValueSetter.call(input, amount.toString());
+
+            const events = [
+                new Event('input', { bubbles: true }),
+                new Event('change', { bubbles: true }),
+                new KeyboardEvent('keydown', { bubbles: true, key: amount.toString() }),
+                new KeyboardEvent('keyup', { bubbles: true, key: amount.toString() }),
+            ];
+
+            events.forEach(event => input.dispatchEvent(event));
+            input.dispatchEvent(new Event('blur', { bubbles: true }));
+
+            await sleep(500);
+
+            if (input.value !== amount.toString()) {
+                log(`⚠️ 金额输入可能失败,当前值: ${input.value}`, 'warn');
+            } else {
+                log(`✅ 金额已输入: ${amount}`, 'success');
+            }
+
+            await sleep(500);
+        }
+
+        /**
+         * 查找购买按钮
+         */
+        async findBuyButton() {
+            log('正在查找购买按钮...', 'info');
+
+            let buyButton = null;
+
+            const divs = Array.from(document.querySelectorAll('div'));
+            buyButton = divs.find(div => {
+                const text = div.textContent.trim();
+                const classes = div.className || '';
+                return text.startsWith('Buy') &&
+                       (text.includes('YES') || text.includes('NO')) &&
+                       classes.includes('rounded-full') &&
+                       (classes.includes('bg-white') || classes.includes('cursor-pointer'));
+            });
+
+            if (!buyButton) {
+                const allElements = Array.from(document.querySelectorAll('div, button'));
+                buyButton = allElements.find(el => {
+                    const text = el.textContent.trim();
+                    return /^Buy\s+.+\s*-\s*(YES|NO)$/.test(text);
+                });
+            }
+
+            if (!buyButton) {
+                throw new Error('未找到购买按钮');
+            }
+
+            log(`找到购买按钮: ${buyButton.textContent.trim()}`, 'success');
+            return buyButton;
+        }
+
+        /**
+         * 等待交易确认
+         */
+        async waitForTransactionConfirmation(tradeType) {
+            log(`⏳ 等待${tradeType}交易确认中(最多60秒)...`, 'info');
+
+            for (let i = 0; i < 60; i++) {
+                if (this.shouldStop) return false;
+
+                await sleep(1000);
+
+                // 检查持仓变化
+                const hasPositions = await this.checkPositions();
+
+                if (hasPositions) {
+                    log('✅ 检测到交易已确认 (持仓出现)', 'success');
+                    return true;
+                }
+
+                if (i % 5 === 0 && i > 0) {
+                    log(`⏳ 继续等待交易确认... (${60-i}秒剩余)`, 'info');
+                }
+            }
+
+            log('⚠️ 60秒内未检测到交易确认', 'warn');
+            return false;
+        }
+
+        /**
+         * 监控订单成交情况 (市价单模式下,买入后直接返回true)
+         */
+        async monitorOrders() {
+            log('👀 检查成交状态...', 'info');
+
+            // 由于我们使用市价单直接买入,placeBothOrders() 中已经等待了持仓确认
+            // 这里只需要验证一下是否有持仓
+            const hasPositions = await this.checkPositions();
+
+            if (hasPositions) {
+                log('✅ 检测到持仓存在 (市价单已成交)', 'success');
+                return true;
+            } else {
+                log('⚠️ 未检测到持仓,可能交易未成功', 'warn');
+                return false;
+            }
+        }
+
+        /**
+         * 检查持仓
+         */
+        async checkPositions() {
+            // 复用现有的持仓检查逻辑
+            const walletAddr = await getWalletAddress();
+
+            if (walletAddr) {
+                try {
+                    const apiResult = await fetchPositionsFromAPI(walletAddr);
+                    if (apiResult !== null) {
+                        return parseAPIPositions(apiResult);
+                    } else {
+                        return await checkPositionsFromDOM();
+                    }
+                } catch (error) {
+                    log(`检查持仓异常: ${error.message}, 降级到DOM方案`, 'error');
+                    return await checkPositionsFromDOM();
+                }
+            } else {
+                return await checkPositionsFromDOM();
+            }
+        }
+
+        /**
+         * 取消未成交的订单 (市价单模式下无需撤单)
+         */
+        async cancelPendingOrders() {
+            log('🚫 跳过撤单步骤 (市价单模式下无需撤单)', 'info');
+            // 由于我们使用市价单直接买入,没有挂单等待,所以不需要撤单
+            return true;
+        }
+
+        /**
+         * 处理成交后的卖出
+         */
+        async handleFilledOrder() {
+            log('💰 正在处理成交订单...', 'info');
+
+            // 等待一段时间让持仓确认
+            await sleep(2000);
+
+            // 检查当前 tab
+            const buyTab = Array.from(document.querySelectorAll('button[role="tab"]')).find(tab => {
+                const text = tab.textContent.trim();
+                return text === 'Sell';
+            });
+
+            const sellTab = Array.from(document.querySelectorAll('button[role="tab"]')).find(tab => {
+                const text = tab.textContent.trim();
+                return text === 'Sell';
+            });
+
+            // 确保在 Sell tab
+            if (buyTab && buyTab.hasAttribute('data-selected')) {
+                log('切换到 Sell tab', 'info');
+                if (sellTab) {
+                    sellTab.click();
+                    await sleep(1000);
+                }
+            }
+
+            // 复用现有的卖出逻辑
+            await this.sellPosition();
+        }
+
+        /**
+         * 卖出持仓 (复用 OpinionTrader 的逻辑)
+         */
+        async sellPosition() {
+            log('准备卖出持仓...', 'info');
+
+            const positionRows = Array.from(document.querySelectorAll('tbody tr'));
+            let soldCount = 0;
+
+            for (const row of positionRows) {
+                const cells = Array.from(row.querySelectorAll('td'));
+
+                if (cells.length < 3) continue;
+
+                const outcomeText = cells[0].textContent.trim();
+                const hasSellButton = row.textContent.includes('Sell');
+
+                if ((outcomeText.includes('YES') || outcomeText.includes('NO')) && hasSellButton) {
+                    const sharesCell = cells[1];
+                    const sharesText = sharesCell.textContent.trim();
+                    log(`找到持仓: ${outcomeText}, Shares: ${sharesText}`, 'info');
+
+                    const sellButton = Array.from(row.querySelectorAll('button')).find(btn =>
+                        btn.textContent.trim() === 'Sell'
+                    );
+
+                    if (sellButton) {
+                        log('点击持仓表格中的 Sell 按钮', 'info');
+                        sellButton.click();
+
+                        await sleep(2000);
+
+                        // 查找 Max 按钮和 Shares 输入框
+                        const sellTabPanel = Array.from(document.querySelectorAll('div[role="tabpanel"]')).find(panel => {
+                            return panel.id && panel.id.includes('content-1') &&
+                                   panel.getAttribute('data-state') === 'open';
+                        });
+
+                        if (!sellTabPanel) {
+                            log('⚠️ 未找到卖出 tab 面板', 'warn');
+                            continue;
+                        }
+
+                        let maxButton = null;
+                        let sharesInput = null;
+
+                        for (let attempt = 0; attempt < 15; attempt++) {
+                            const maxButtons = Array.from(sellTabPanel.querySelectorAll('button'));
+                            maxButton = maxButtons.find(btn => btn.textContent.trim() === 'Max');
+
+                            const labels = Array.from(sellTabPanel.querySelectorAll('p'));
+                            const sharesLabel = labels.find(p => p.textContent.trim() === 'Shares');
+
+                            if (sharesLabel) {
+                                let container = sharesLabel.parentElement;
+                                while (container && !sharesInput) {
+                                    sharesInput = container.querySelector('input[type="text"]');
+                                    if (!sharesInput) {
+                                        container = container.parentElement;
+                                    }
+                                }
+                            }
+
+                            if (maxButton && sharesInput) {
+                                break;
+                            }
+
+                            await sleep(500);
+                        }
+
+                        if (!maxButton || !sharesInput) {
+                            log('⚠️ Max按钮或Shares输入框未找到', 'warn');
+                            continue;
+                        }
+
+                        maxButton.click();
+                        await sleep(500);
+
+                        // 查找确认卖出按钮
+                        let sellConfirmButton = null;
+                        for (let attempt = 0; attempt < 15; attempt++) {
+                            const divs = Array.from(sellTabPanel.querySelectorAll('div'));
+                            sellConfirmButton = divs.find(div => {
+                                const text = div.textContent.trim();
+                                return text.includes('Sell') &&
+                                       (text.includes('YES') || text.includes('NO')) &&
+                                       div.className.includes('rounded-full');
+                            });
+
+                            if (sellConfirmButton) {
+                                break;
+                            }
+
+                            await sleep(500);
+                        }
+
+                        if (!sellConfirmButton) {
+                            log('⚠️ 未找到确认卖出按钮', 'warn');
+                            continue;
+                        }
+
+                        // 等待按钮可操作
+                        for (let attempt = 0; attempt < 20; attempt++) {
+                            const buttonClasses = sellConfirmButton.className || '';
+                            const isDisabled = buttonClasses.includes('cursor-not-allowed') ||
+                                             sellConfirmButton.hasAttribute('disabled');
+
+                            if (!isDisabled) {
+                                break;
+                            }
+
+                            await sleep(500);
+                        }
+
+                        sellConfirmButton.click();
+                        soldCount++;
+
+                        log('⏳ 请在MetaMask钱包中确认卖出交易...', 'warn');
+
+                        // 等待交易确认
+                        await sleep(5000);
+                    }
+                }
+            }
+
+            if (soldCount === 0) {
+                log('⚠️ 未找到可卖出的持仓', 'warn');
+            } else {
+                log(`✅ 成功提交 ${soldCount} 个卖出订单`, 'success');
+            }
+        }
+
+        /**
+         * Maker 模式主循环
+         */
+        async runMakerLoop() {
+            try {
+                log('=== 开始 Maker 模式交易循环 ===', 'info');
+                this.isRunning = true;
+                this.shouldStop = false;
+
+                let cycleCount = 0;
+                while (!this.shouldStop) {
+                    cycleCount++;
+                    log(`\n========== Maker 循环 #${cycleCount} ==========`, 'info');
+
+                    // 1. 初始化市场信息
+                    if (this.shouldStop) throw new Error('用户手动停止');
+                    await this.initMarketInfo();
+
+                    // 2. 获取订单簿深度
+                    if (this.shouldStop) throw new Error('用户手动停止');
+                    await this.fetchDepth();
+
+                    // 3. 同时挂买卖单
+                    if (this.shouldStop) throw new Error('用户手动停止');
+                    await this.placeBothOrders();
+
+                    // 4. 监控成交
+                    if (this.shouldStop) throw new Error('用户手动停止');
+                    const hasFilled = await this.monitorOrders();
+
+                    if (hasFilled) {
+                        // 5. 取消未成交订单
+                        if (this.shouldStop) throw new Error('用户手动停止');
+                        await this.cancelPendingOrders();
+
+                        // 6. 卖出成交仓位
+                        if (this.shouldStop) throw new Error('用户手动停止');
+                        await this.handleFilledOrder();
+
+                        log('✅ 本轮交易完成,准备下一轮...', 'success');
+                    } else {
+                        log('⚠️ 超时未成交,重新开始...', 'warn');
+                    }
+
+                    await sleep(1000);
+                    log(`========== 循环 #${cycleCount} 完成 ==========\n`, 'success');
+                }
+
+                log('=== Maker 交易循环已停止 ===', 'success');
+
+            } catch (error) {
+                if (error.message === '用户手动停止') {
+                    log('⚠️ 交易已被用户停止', 'warn');
+                } else {
+                    log(`❌ Maker 交易失败: ${error.message}`, 'error');
+                    throw error;
+                }
+            } finally {
+                this.isRunning = false;
+                this.shouldStop = false;
+            }
+        }
+
+        start() {
+            if (this.isRunning) {
+                log('Maker 交易已在运行中', 'warn');
+                return;
+            }
+
+            if (!this.config.marketUrl) {
+                log('请先配置市场链接', 'error');
+                return;
+            }
+
+            if (!window.location.href.includes(this.config.marketUrl.replace('https://app.opinion.trade', ''))) {
+                log(`正在跳转到市场页面: ${this.config.marketUrl}`, 'info');
+                window.location.href = this.config.marketUrl;
+                return;
+            }
+
+            this.runMakerLoop();
+        }
+
+        stop() {
+            if (!this.isRunning) {
+                log('Maker 交易未在运行中', 'warn');
+                return;
+            }
+
+            log('正在停止 Maker 交易...', 'info');
+            this.shouldStop = true;
+        }
+    }
 
     class OpinionTrader {
         constructor() {
@@ -1251,6 +2084,35 @@
                             margin-bottom: 8px;
                             font-weight: 500;
                             font-size: 14px;
+                        ">交易模式</label>
+                        <select id="cfg-tradeMode"
+                            style="
+                                width: 100%;
+                                padding: 12px 14px;
+                                border: 2px solid #e5e7eb;
+                                border-radius: 8px;
+                                font-size: 14px;
+                                transition: all 0.2s;
+                                box-sizing: border-box;
+                                background: #f9fafb;
+                                cursor: pointer;
+                                color: #1a1a1a;
+                            "
+                            onfocus="this.style.borderColor='#3b82f6'; this.style.background='#ffffff';"
+                            onblur="this.style.borderColor='#e5e7eb'; this.style.background='#f9fafb';"
+                        >
+                            <option value="taker" ${config.tradeMode === 'taker' ? 'selected' : ''}>Taker (吃单模式)</option>
+                            <option value="maker" ${config.tradeMode === 'maker' ? 'selected' : ''}>Maker (挂单模式)</option>
+                        </select>
+                    </div>
+
+                    <div style="margin-bottom: 20px;">
+                        <label style="
+                            color: #374151;
+                            display: block;
+                            margin-bottom: 8px;
+                            font-weight: 500;
+                            font-size: 14px;
                         ">交易前等待(秒)</label>
                         <input type="number" id="cfg-waitBeforeTrade" value="${config.waitBeforeTrade}" min="0"
                             style="
@@ -1375,6 +2237,7 @@
                 tradeAmount: parseFloat(document.getElementById('cfg-tradeAmount').value),
                 holdTime: parseInt(document.getElementById('cfg-holdTime').value),
                 tradeType: document.getElementById('cfg-tradeType').value,
+                tradeMode: document.getElementById('cfg-tradeMode').value,
                 waitBeforeTrade: parseInt(document.getElementById('cfg-waitBeforeTrade').value),
                 sellWaitTime: parseInt(document.getElementById('cfg-sellWaitTime').value),
                 useApiFirst: document.getElementById('cfg-useApiFirst').checked,
@@ -1443,7 +2306,14 @@
                     border: 1px solid #e5e7eb;
                 ">
                     <div style="color: #1a1a1a; font-size: 15px; font-weight: 600; margin-bottom: 12px; letter-spacing: -0.3px;">
-                        🤖 Opinion Trader (API版)
+                        🤖 Opinion Trader <span id="mode-badge" style="
+                            font-size: 11px;
+                            padding: 2px 8px;
+                            border-radius: 4px;
+                            background: #3b82f6;
+                            color: white;
+                            margin-left: 4px;
+                        ">${Config.get('tradeMode') === 'maker' ? 'Maker' : 'Taker'}</span>
                     </div>
                     <button id="start-trade" style="
                         background: #3b82f6;
@@ -1485,11 +2355,26 @@
                             updateTradeButton(false);
                             currentTrader = null;
                         } else {
-                            const trader = new OpinionTrader();
+                            const config = Config.getAll();
+                            const tradeMode = config.tradeMode;
+
+                            // 根据交易模式选择不同的交易器
+                            let trader;
+                            if (tradeMode === 'maker') {
+                                log('🎯 启动 Maker 模式', 'info');
+                                trader = new MakerTrader();
+                            } else {
+                                log('🎯 启动 Taker 模式', 'info');
+                                trader = new OpinionTrader();
+                            }
+
                             currentTrader = trader;
 
-                            const originalExecuteTrade = trader.executeTrade.bind(trader);
-                            trader.executeTrade = async function() {
+                            const originalExecuteTrade = trader.executeTrade ?
+                                trader.executeTrade.bind(trader) :
+                                trader.runMakerLoop.bind(trader);
+
+                            const wrappedMethod = async function() {
                                 try {
                                     updateTradeButton(true);
                                     await originalExecuteTrade();
@@ -1500,6 +2385,13 @@
                                     }
                                 }
                             };
+
+                            // 绑定包装后的方法
+                            if (tradeMode === 'maker') {
+                                trader.runMakerLoop = wrappedMethod;
+                            } else {
+                                trader.executeTrade = wrappedMethod;
+                            }
 
                             trader.start();
                         }
