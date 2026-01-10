@@ -18,6 +18,16 @@
 (function() {
     'use strict';
 
+    // ==================== 常量定义 ====================
+    const CONSTANTS = {
+        MIN_POSITION_VALUE: 1,        // 最小持仓市值(美元)
+        API_TIMEOUT: 10000,           // API请求超时时间(毫秒)
+        WALLET_ADDRESS_LENGTH: 42,    // 完整钱包地址长度
+        POSITION_CHECK_INTERVAL: 1000,// 持仓检查间隔(毫秒)
+        POSITION_CHECK_MAX_ATTEMPTS: 30,// 持仓检查最大尝试次数
+        DOM_WAIT_TIME: 2000          // DOM等待时间(毫秒)
+    };
+
     // ==================== 配置管理 ====================
     const DEFAULT_CONFIG = {
         marketUrl: 'https://app.opinion.trade/detail?topicId=61&type=multi',
@@ -125,10 +135,13 @@
                     const text = el.textContent.trim();
                     // 钱包地址通常是 0x 开头的42位字符(可能被截断显示为 0x1234...abcd)
                     if (text.match(/^0x[a-fA-F0-9]{4,40}$/)) {
-                        log(`找到钱包地址(截断): ${text}`, 'success');
-                        // 如果是截断的地址,需要从其他地方获取完整地址
-                        // 这里我们先尝试返回,如果不行则使用方法2
-                        return text;
+                        // 只有42位完整地址才使用,截断地址继续查找
+                        if (text.length === CONSTANTS.WALLET_ADDRESS_LENGTH) {
+                            log(`从DOM找到完整钱包地址: ${text.slice(0, 6)}...${text.slice(-4)}`, 'success');
+                            return text;
+                        } else {
+                            log(`找到截断地址: ${text},继续查找完整地址`, 'info');
+                        }
                     }
                 }
             }
@@ -137,16 +150,17 @@
             const storageKeys = ['walletAddress', 'userAddress', 'account', 'wallet'];
             for (const key of storageKeys) {
                 const value = localStorage.getItem(key) || sessionStorage.getItem(key);
-                if (value && value.match(/^0x[a-fA-F0-9]{40}$/)) {
-                    log(`从存储找到钱包地址: ${value}`, 'success');
+                if (value && value.length === CONSTANTS.WALLET_ADDRESS_LENGTH && value.match(/^0x[a-fA-F0-9]+$/)) {
+                    log(`从存储找到钱包地址: ${value.slice(0, 6)}...${value.slice(-4)}`, 'success');
                     return value;
                 }
             }
 
             // 方法3: 尝试从 window 对象获取(某些网站会将钱包信息挂载到 window)
             if (window.ethereum && window.ethereum.selectedAddress) {
-                log(`从 ethereum.selectedAddress 找到: ${window.ethereum.selectedAddress}`, 'success');
-                return window.ethereum.selectedAddress;
+                const addr = window.ethereum.selectedAddress;
+                log(`从 ethereum.selectedAddress 找到: ${addr.slice(0, 6)}...${addr.slice(-4)}`, 'success');
+                return addr;
             }
 
             log('⚠️ 未能自动获取钱包地址', 'warn');
@@ -194,11 +208,24 @@
                             const data = JSON.parse(response.responseText);
 
                             if (data.errno === 0 && data.result) {
+                                // 验证数据结构
+                                if (typeof data.result !== 'object') {
+                                    log('API返回数据格式异常: result不是对象', 'warn');
+                                    resolve(null);
+                                    return;
+                                }
+
+                                if (!Array.isArray(data.result.list)) {
+                                    log('API返回数据格式异常: list字段不是数组', 'warn');
+                                    resolve(null);
+                                    return;
+                                }
+
                                 log('✅ API请求成功', 'success');
-                                log(`返回数据: ${JSON.stringify(data, null, 2)}`, 'info');
+                                log(`返回持仓数量: ${data.result.list.length}`, 'info');
                                 resolve(data.result);
                             } else {
-                                log(`API返回错误: ${data.errmsg || '未知错误'}`, 'warn');
+                                log(`API返回错误: ${data.errmsg || '未知错误'} (errno: ${data.errno})`, 'warn');
                                 resolve(null);
                             }
                         } else {
@@ -207,18 +234,26 @@
                         }
                     } catch (error) {
                         log(`解析API响应失败: ${error.message}`, 'error');
+                        // 记录响应内容的前200字符用于调试
+                        if (response.responseText) {
+                            const preview = response.responseText.substring(0, 200);
+                            log(`响应内容预览: ${preview}${response.responseText.length > 200 ? '...' : ''}`, 'error');
+                        }
                         resolve(null);
                     }
                 },
                 onerror: function(error) {
-                    log(`API网络请求失败: ${error}`, 'error');
+                    const timestamp = new Date().toISOString();
+                    log(`API网络请求失败: ${timestamp}`, 'error');
+                    log(`请求URL: ${apiUrl}`, 'error');
                     resolve(null);
                 },
                 ontimeout: function() {
                     log('API请求超时', 'warn');
                     resolve(null);
                 },
-                timeout: 10000  // 10秒超时
+                timeout: CONSTANTS.API_TIMEOUT
+            });
             });
         });
     }
@@ -235,10 +270,10 @@
 
         log(`API返回 ${apiResult.list.length} 个持仓记录`, 'info');
 
-        // 过滤有效持仓(市值 > 1)
+        // 过滤有效持仓(市值 > MIN_POSITION_VALUE)
         const validPositions = apiResult.list.filter(position => {
             const value = parseFloat(position.value || 0);
-            const logValid = value > 1;
+            const logValid = value > CONSTANTS.MIN_POSITION_VALUE;
             if (logValid) {
                 log(`有效持仓: ${position.topicTitle} - ${position.outcome}, 市值: $${value}`, 'info');
             }
@@ -246,10 +281,10 @@
         });
 
         if (validPositions.length > 0) {
-            log(`✅ API检测到 ${validPositions.length} 个有效持仓(市值>$1)`, 'success');
+            log(`✅ API检测到 ${validPositions.length} 个有效持仓(市值>$${CONSTANTS.MIN_POSITION_VALUE})`, 'success');
             return true;
         } else {
-            log('✅ API显示无有效持仓或市值≤$1', 'success');
+            log(`✅ API显示无有效持仓或市值≤$${CONSTANTS.MIN_POSITION_VALUE}`, 'success');
             return false;
         }
     }
@@ -264,7 +299,7 @@
         log('🔄 降级到DOM方案获取持仓...', 'info');
 
         // 等待持仓页面加载
-        await sleep(2000);
+        await sleep(CONSTANTS.DOM_WAIT_TIME);
 
         // 查找持仓表格
         const positionRows = Array.from(document.querySelectorAll('tbody tr'));
@@ -293,7 +328,7 @@
                 const marketValue = parseFloat(marketValueMatch[1].replace(/,/g, ''));
                 log(`DOM检测持仓市值: ${marketValueText}`, 'info');
 
-                if (!isNaN(marketValue) && marketValue > 1) {
+                if (!isNaN(marketValue) && marketValue > CONSTANTS.MIN_POSITION_VALUE) {
                     log(`✅ DOM检测到有效持仓(市值: $${marketValue})`, 'info');
                     return true;
                 }
