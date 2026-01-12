@@ -871,10 +871,14 @@
 
         /**
          * 输入限价单价格
-         * @param {number} price - 价格值 (已经是小数形式,如 0.044)
+         * @param {number} price - 价格值 (小数形式,如 0.044,需要转换为4.4)
          */
         async inputPrice(price) {
-            log(`准备输入价格: ${price}`, 'info');
+            // 将小数价格转换为 cents 格式 (乘以100)
+            // 0.044 -> 4.4
+            const priceInCents = price * 100;
+
+            log(`准备输入价格: ${price} (转换为 ${priceInCents}¢)`, 'info');
 
             const priceInput = await this.findPriceInput();
 
@@ -893,8 +897,8 @@
             priceInput.dispatchEvent(new Event('input', { bubbles: true }));
             await sleep(100);
 
-            // 直接输入价格值 (不要转换,直接使用小数)
-            const priceStr = price.toString();
+            // 输入 cents 格式的价格
+            const priceStr = priceInCents.toString();
             nativeInputValueSetter.call(priceInput, priceStr);
 
             // 触发事件
@@ -912,16 +916,17 @@
 
             // 验证输入
             const currentValue = priceInput.value;
-            if (currentValue === priceStr || currentValue === price) {
-                log(`✅ 价格已输入: ${price}`, 'success');
+            const currentNum = parseFloat(currentValue);
+
+            // 允许一定的浮点数误差
+            if (Math.abs(currentNum - priceInCents) < 0.01) {
+                log(`✅ 价格已输入: ${priceInCents}¢ (${price})`, 'success');
             } else {
                 log(`⚠️ 价格输入可能失败`, 'warn');
-                log(`  期望值: ${priceStr}`, 'warn');
+                log(`  期望值: ${priceInCents}¢ (${price})`, 'warn');
                 log(`  当前值: ${currentValue}`, 'warn');
 
-                // 尝试其他格式 (有些平台可能需要 cents 格式)
-                // 但这里我们直接抛出错误,因为应该直接使用小数
-                throw new Error(`价格输入失败: 期望 ${priceStr}, 实际 ${currentValue}`);
+                throw new Error(`价格输入失败: 期望 ${priceInCents}¢, 实际 ${currentValue}`);
             }
 
             await sleep(500);
