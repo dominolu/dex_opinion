@@ -876,8 +876,8 @@
         async inputPrice(price) {
             // 将小数价格转换为 cents 格式 (乘以100)
             // 0.044 -> 4.4
-            // 使用 Math.round 避免浮点数精度问题
-            const priceInCents = Math.round(price * 100);
+            // 不使用 Math.round(),而是保留一位小数
+            const priceInCents = parseFloat((price * 100).toFixed(1));
 
             log(`准备输入价格: ${price} (转换为 ${priceInCents}¢)`, 'info');
 
@@ -905,7 +905,7 @@
             priceInput.dispatchEvent(new Event('input', { bubbles: true }));
             await sleep(100);
 
-            // 输入 cents 格式的价格 - 使用整数避免浮点数问题
+            // 输入 cents 格式的价格
             const priceStr = priceInCents.toString();
             nativeInputValueSetter.call(priceInput, priceStr);
 
