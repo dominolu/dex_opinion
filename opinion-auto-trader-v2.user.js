@@ -716,12 +716,10 @@
         }
 
         /**
-         * 同时在 ask1 和 bid1 挂单 (使用 DOM 操作,类似 taker 模式)
-         * 注意: 由于 Opinion.trade 可能不支持限价单 API
-         * 这里使用市价单方式: 在 ask1 价格挂买单,在 bid1 价格挂卖单
+         * 同时在 ask1 和 bid1 挂单 (使用 DOM 操作实现限价单)
          */
         async placeBothOrders() {
-            log('🔄 准备同时挂买卖单 (市价单模式)...', 'info');
+            log('🔄 准备同时挂买卖单 (限价单模式)...', 'info');
 
             if (!this.depthData) {
                 throw new Error('订单簿深度未获取');
@@ -756,7 +754,7 @@
             }
 
             // === 步骤 1: 选择选项 ===
-            log('步骤 1/4: 选择选项...', 'info');
+            log('步骤 1/5: 选择选项...', 'info');
             const optionButton = await this.findOptionButton(this.config.optionName);
             if (!optionButton) {
                 throw new Error(`未找到选项: ${this.config.optionName}`);
@@ -765,18 +763,27 @@
             await sleep(1000);
 
             // === 步骤 2: 点击 YES 按钮 (准备买) ===
-            log('步骤 2/4: 点击 YES 按钮准备买入...', 'info');
+            log('步骤 2/5: 点击 YES 按钮准备买入...', 'info');
             const yesButton = await this.findTradeButton('YES');
             yesButton.click();
             await sleep(1000);
 
-            // === 步骤 3: 输入金额 ===
-            log('步骤 3/4: 输入买入金额...', 'info');
+            // === 步骤 3: 输入限价单价格 ===
+            log('步骤 3/5: 输入限价单价格...', 'info');
+
+            // 使用 ask1 价格作为买入限价 (稍微高一点点确保成交)
+            const limitPrice = ask1Price;
+            await this.inputPrice(limitPrice);
+
+            // === 步骤 4: 输入金额 ===
+            log('步骤 4/5: 输入下单金额...', 'info');
             await this.inputAmount(this.config.tradeAmount);
+
+            // 等待一下确保输入生效
             await sleep(1000);
 
-            // === 步骤 4: 点击买入按钮 ===
-            log('步骤 4/4: 点击买入按钮...', 'info');
+            // === 步骤 5: 点击买入按钮 ===
+            log('步骤 5/5: 点击买入按钮...', 'info');
             const buyButton = await this.findBuyButton();
             buyButton.click();
 
@@ -789,7 +796,7 @@
                 throw new Error('买入交易未能在预期时间内确认');
             }
 
-            log('✅ 买单已提交', 'success');
+            log('✅ 限价买单已提交', 'success');
 
             // 等待持仓出现
             log('⏳ 等待持仓确认...', 'info');
@@ -815,11 +822,109 @@
                 log('⚠️ 30秒内未检测到持仓出现,但继续执行', 'warn');
             }
 
-            log('✅ 挂单流程完成 (市价单模式)', 'success');
+            log('✅ 限价单挂单流程完成', 'success');
+        }
 
-            // 注意: 由于使用的是市价单而非限价单
-            // 实际上我们已经买入了,而不是挂单等待
-            // 这种模式下,monitorOrders 会检测到持仓,然后直接卖出
+        /**
+         * 查找价格输入框
+         */
+        async findPriceInput() {
+            log('正在查找价格输入框', 'info');
+
+            // 价格输入框可能和金额输入框不同
+            // 尝试多种选择器
+            const selectors = [
+                'input[placeholder*="price" i]',
+                'input[placeholder*="Price" i]',
+                'input[placeholder*="¢"]',
+                'input[placeholder*="cents" i]',
+                'input[type="number"]',
+            ];
+
+            for (const selector of selectors) {
+                const inputs = Array.from(document.querySelectorAll(selector));
+                for (const input of inputs) {
+                    // 检查是否可见
+                    const rect = input.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        // 检查是否不是金额输入框(金额输入框通常placeholder是0)
+                        if (input.placeholder !== '0') {
+                            log(`找到价格输入框 (selector: ${selector})`, 'success');
+                            return input;
+                        }
+                    }
+                }
+            }
+
+            // 如果没找到,尝试查找所有文本输入框
+            const allTextInputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'));
+            for (const input of allTextInputs) {
+                const rect = input.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0 && input.placeholder !== '0') {
+                    log(`找到可能的 price 输入框`, 'info');
+                    return input;
+                }
+            }
+
+            throw new Error('未找到价格输入框');
+        }
+
+        /**
+         * 输入限价单价格
+         * @param {number} price - 价格值 (已经是小数形式,如 0.044)
+         */
+        async inputPrice(price) {
+            log(`准备输入价格: ${price}`, 'info');
+
+            const priceInput = await this.findPriceInput();
+
+            // 点击并聚焦
+            priceInput.click();
+            priceInput.focus();
+            await sleep(300);
+
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype,
+                'value'
+            ).set;
+
+            // 清空当前值
+            nativeInputValueSetter.call(priceInput, '');
+            priceInput.dispatchEvent(new Event('input', { bubbles: true }));
+            await sleep(100);
+
+            // 直接输入价格值 (不要转换,直接使用小数)
+            const priceStr = price.toString();
+            nativeInputValueSetter.call(priceInput, priceStr);
+
+            // 触发事件
+            const events = [
+                new Event('input', { bubbles: true }),
+                new Event('change', { bubbles: true }),
+                new KeyboardEvent('keydown', { bubbles: true, key: priceStr }),
+                new KeyboardEvent('keyup', { bubbles: true, key: priceStr }),
+            ];
+
+            events.forEach(event => priceInput.dispatchEvent(event));
+            priceInput.dispatchEvent(new Event('blur', { bubbles: true }));
+
+            await sleep(500);
+
+            // 验证输入
+            const currentValue = priceInput.value;
+            if (currentValue === priceStr || currentValue === price) {
+                log(`✅ 价格已输入: ${price}`, 'success');
+            } else {
+                log(`⚠️ 价格输入可能失败`, 'warn');
+                log(`  期望值: ${priceStr}`, 'warn');
+                log(`  当前值: ${currentValue}`, 'warn');
+
+                // 尝试其他格式 (有些平台可能需要 cents 格式)
+                // 但这里我们直接抛出错误,因为应该直接使用小数
+                throw new Error(`价格输入失败: 期望 ${priceStr}, 实际 ${currentValue}`);
+            }
+
+            await sleep(500);
         }
 
         /**
