@@ -876,11 +876,19 @@
         async inputPrice(price) {
             // 将小数价格转换为 cents 格式 (乘以100)
             // 0.044 -> 4.4
-            const priceInCents = price * 100;
+            // 使用 Math.round 避免浮点数精度问题
+            const priceInCents = Math.round(price * 100);
 
             log(`准备输入价格: ${price} (转换为 ${priceInCents}¢)`, 'info');
 
             const priceInput = await this.findPriceInput();
+
+            // 调试: 记录输入框信息
+            log(`价格输入框信息:`, 'info');
+            log(`  type: ${priceInput.type}`, 'info');
+            log(`  placeholder: ${priceInput.placeholder}`, 'info');
+            log(`  id: ${priceInput.id}`, 'info');
+            log(`  className: ${priceInput.className}`, 'info');
 
             // 点击并聚焦
             priceInput.click();
@@ -897,9 +905,11 @@
             priceInput.dispatchEvent(new Event('input', { bubbles: true }));
             await sleep(100);
 
-            // 输入 cents 格式的价格
+            // 输入 cents 格式的价格 - 使用整数避免浮点数问题
             const priceStr = priceInCents.toString();
             nativeInputValueSetter.call(priceInput, priceStr);
+
+            log(`设置输入框值为: ${priceStr}`, 'info');
 
             // 触发事件
             const events = [
@@ -918,18 +928,81 @@
             const currentValue = priceInput.value;
             const currentNum = parseFloat(currentValue);
 
+            log(`验证输入: 当前值="${currentValue}", 数值=${currentNum}`, 'info');
+
             // 允许一定的浮点数误差
-            if (Math.abs(currentNum - priceInCents) < 0.01) {
+            if (Math.abs(currentNum - priceInCents) < 0.1) {
                 log(`✅ 价格已输入: ${priceInCents}¢ (${price})`, 'success');
             } else {
                 log(`⚠️ 价格输入可能失败`, 'warn');
                 log(`  期望值: ${priceInCents}¢ (${price})`, 'warn');
-                log(`  当前值: ${currentValue}`, 'warn');
+                log(`  当前值: "${currentValue}" (数值: ${currentNum})`, 'warn');
 
-                throw new Error(`价格输入失败: 期望 ${priceInCents}¢, 实际 ${currentValue}`);
+                // 尝试逐字符输入
+                log('尝试逐字符输入价格...', 'info');
+                await this.typePriceSlowly(priceInput, priceStr);
             }
 
             await sleep(500);
+        }
+
+        /**
+         * 逐字符输入价格 (备用方法)
+         */
+        async typePriceSlowly(input, priceStr) {
+            input.click();
+            input.focus();
+            await sleep(200);
+
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype,
+                'value'
+            ).set;
+
+            // 清空
+            nativeInputValueSetter.call(input, '');
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            await sleep(100);
+
+            // 逐字符输入
+            for (let i = 0; i < priceStr.length; i++) {
+                const char = priceStr[i];
+                nativeInputValueSetter.call(input, input.value + char);
+
+                // 触发输入事件
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new KeyboardEvent('keydown', {
+                    bubbles: true,
+                    key: char,
+                    keyCode: char.charCodeAt(0)
+                }));
+                input.dispatchEvent(new KeyboardEvent('keyup', {
+                    bubbles: true,
+                    key: char,
+                    keyCode: char.charCodeAt(0)
+                }));
+
+                await sleep(50); // 每个字符之间暂停
+            }
+
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            input.dispatchEvent(new Event('blur', { bubbles: true }));
+
+            await sleep(500);
+
+            // 再次验证
+            const currentValue = input.value;
+            const currentNum = parseFloat(currentValue);
+            const expectedNum = parseFloat(priceStr);
+
+            if (Math.abs(currentNum - expectedNum) < 0.1) {
+                log(`✅ 逐字符输入成功: ${currentValue}`, 'success');
+            } else {
+                log(`❌ 逐字符输入也失败`, 'error');
+                log(`  期望: ${priceStr}`, 'error');
+                log(`  当前: ${currentValue}`, 'error');
+                throw new Error(`价格输入失败: 期望 ${priceStr}, 实际 ${currentValue}`);
+            }
         }
 
         /**
